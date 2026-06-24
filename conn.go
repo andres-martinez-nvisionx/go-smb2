@@ -334,6 +334,9 @@ type conn struct {
 	// clientGuid        [16]byte
 
 	useSession atomic.Bool
+
+	dfsCache     *dfsReferralCache // DFS referral cache, shared by all trees on this conn
+	dfsCacheOnce sync.Once
 }
 
 func (conn *conn) loanCredit(ctx context.Context, payloadSize int) (creditCharge uint16, grantedPayloadSize int, err error) {

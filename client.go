@@ -247,7 +247,11 @@ func (c *Session) ListSharenames() ([]string, error) {
 
 	r1 := msrpc.BindAckDecoder(output)
 	if r1.IsInvalid() || r1.CallId() != callId {
-		return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken bind ack response format"}}
+		return nil, &os.PathError{
+			Op:   "listSharenames",
+			Path: f.name,
+			Err:  &InvalidResponseError{"broken bind ack response format"},
+		}
 	}
 
 	callId++
@@ -283,7 +287,11 @@ func (c *Session) ListSharenames() ([]string, error) {
 
 			r2 := msrpc.NetShareEnumAllResponseDecoder(output)
 			if r2.IsInvalid() || r2.CallId() != callId {
-				return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
+				return nil, &os.PathError{
+					Op:   "listSharenames",
+					Path: f.name,
+					Err:  &InvalidResponseError{"broken net share enum response format"},
+				}
 			}
 
 			for r2.IsIncomplete() {
@@ -294,7 +302,11 @@ func (c *Session) ListSharenames() ([]string, error) {
 
 				r3 := msrpc.NetShareEnumAllResponseDecoder(buf[:n])
 				if r3.IsInvalid() || r3.CallId() != callId {
-					return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
+					return nil, &os.PathError{
+						Op:   "listSharenames",
+						Path: f.name,
+						Err:  &InvalidResponseError{"broken net share enum response format"},
+					}
 				}
 
 				output = append(output, r3.Buffer()...)
@@ -310,7 +322,11 @@ func (c *Session) ListSharenames() ([]string, error) {
 
 	r2 := msrpc.NetShareEnumAllResponseDecoder(output)
 	if r2.IsInvalid() || r2.IsIncomplete() || r2.CallId() != callId {
-		return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
+		return nil, &os.PathError{
+			Op:   "listSharenames",
+			Path: f.name,
+			Err:  &InvalidResponseError{"broken net share enum response format"},
+		}
 	}
 
 	return r2.ShareNameList(), nil
@@ -319,8 +335,9 @@ func (c *Session) ListSharenames() ([]string, error) {
 // Share represents a SMB tree connection with VFS interface.
 type Share struct {
 	*treeConn
-	ctx     context.Context
-	mapping utf16le.MapChars
+	ctx      context.Context
+	mapping  utf16le.MapChars
+	dfsDepth int // number of DFS referrals followed to reach this share (loop guard)
 }
 
 func (fs *Share) WithContext(ctx context.Context) *Share {
@@ -331,6 +348,7 @@ func (fs *Share) WithContext(ctx context.Context) *Share {
 		treeConn: fs.treeConn,
 		ctx:      ctx,
 		mapping:  fs.mapping,
+		dfsDepth: fs.dfsDepth,
 	}
 }
 
@@ -513,7 +531,11 @@ func (fs *Share) Readlink(name string) (string, error) {
 
 	r := smb2.SymbolicLinkReparseDataBufferDecoder(output)
 	if r.IsInvalid() {
-		return "", &os.PathError{Op: "readlink", Path: f.name, Err: &InvalidResponseError{"broken symbolic link response data buffer format"}}
+		return "", &os.PathError{
+			Op:   "readlink",
+			Path: f.name,
+			Err:  &InvalidResponseError{"broken symbolic link response data buffer format"},
+		}
 	}
 
 	target := r.SubstituteName(fs.mapping)
@@ -1096,7 +1118,11 @@ func (fs *Share) SecurityInfoRaw(name string, info SecurityInformationRequestFla
 	return f.SecurityInfoRaw(info)
 }
 
-func (fs *Share) SetSecurityInfo(name string, flags SecurityInformationRequestFlags, sd *sddl.SecurityDescriptor) error {
+func (fs *Share) SetSecurityInfo(
+	name string,
+	flags SecurityInformationRequestFlags,
+	sd *sddl.SecurityDescriptor,
+) error {
 	return fs.SetSecurityInfoRaw(name, flags, &SecurityDescriptorEncoder{sd})
 }
 
@@ -1202,6 +1228,9 @@ func (fs *Share) createFileRec(name string, req *smb2.CreateRequest) (f *File, e
 					}
 					continue
 				}
+			}
+			if rerr, ok := err.(*ResponseError); ok && erref.NtStatus(rerr.Code) == erref.STATUS_PATH_NOT_COVERED {
+				return fs.followDfsReferral(name, req)
 			}
 			return nil, err
 		}
@@ -1430,7 +1459,8 @@ func (f *File) readAt(b []byte, off int64) (n int, err error) {
 		case len(b)-n <= maxReadSize:
 			bs, isEOF, rr, err := f.readAtChunk(len(b)-n, int64(n)+off)
 			if err != nil {
-				if err, ok := err.(*ResponseError); ok && erref.NtStatus(err.Code) == erref.STATUS_END_OF_FILE && n != 0 {
+				if err, ok := err.(*ResponseError); ok && erref.NtStatus(err.Code) == erref.STATUS_END_OF_FILE &&
+					n != 0 {
 					return n, nil
 				}
 				return 0, err
@@ -1445,7 +1475,8 @@ func (f *File) readAt(b []byte, off int64) (n int, err error) {
 		default:
 			bs, isEOF, rr, err := f.readAtChunk(maxReadSize, int64(n)+off)
 			if err != nil {
-				if err, ok := err.(*ResponseError); ok && erref.NtStatus(err.Code) == erref.STATUS_END_OF_FILE && n != 0 {
+				if err, ok := err.(*ResponseError); ok && erref.NtStatus(err.Code) == erref.STATUS_END_OF_FILE &&
+					n != 0 {
 					return n, nil
 				}
 				return 0, err
@@ -2068,7 +2099,12 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 
 	sr := smb2.SrvRequestResumeKeyResponseDecoder(output)
 	if sr.IsInvalid() {
-		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: &InvalidResponseError{"broken srv request resume key response format"}}
+		return true, -1, &os.LinkError{
+			Op:  "copy",
+			Old: f.name,
+			New: wf.name,
+			Err: &InvalidResponseError{"broken srv request resume key response format"},
+		}
 	}
 
 	off, err := f.seek(0, io.SeekCurrent)
@@ -2152,7 +2188,12 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 
 		c := smb2.SrvCopychunkResponseDecoder(output)
 		if c.IsInvalid() {
-			return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: &InvalidResponseError{"broken srv copy chunk response format"}}
+			return true, -1, &os.LinkError{
+				Op:  "copy",
+				Old: f.name,
+				New: wf.name,
+				Err: &InvalidResponseError{"broken srv copy chunk response format"},
+			}
 		}
 
 		n += int64(c.TotalBytesWritten())
@@ -2218,7 +2259,9 @@ func (f *File) ioctl(req *smb2.IoctlRequest) (output []byte, err error) {
 	payloadSize := max(f.encodeSize(req.Input)+int(req.OutputCount), int(req.MaxOutputResponse+req.MaxInputResponse))
 
 	if f.maxTransactSize() < payloadSize {
-		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
+		return nil, &InternalError{
+			fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize()),
+		}
 	}
 
 	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
@@ -2263,7 +2306,9 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 	payloadSize := int(req.OutputBufferLength)
 
 	if f.maxTransactSize() < payloadSize {
-		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
+		return nil, &InternalError{
+			fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize()),
+		}
 	}
 
 	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
@@ -2324,7 +2369,9 @@ func (f *File) queryInfo(req *smb2.QueryInfoRequest) (infoBytes []byte, err erro
 	payloadSize := max(f.encodeSize(req.Input), int(req.OutputBufferLength))
 
 	if f.maxTransactSize() < payloadSize {
-		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
+		return nil, &InternalError{
+			fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize()),
+		}
 	}
 
 	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
@@ -2421,7 +2468,9 @@ func (f *File) setInfo(req *smb2.SetInfoRequest) (err error) {
 	payloadSize := f.encodeSize(req.Input)
 
 	if f.maxTransactSize() < payloadSize {
-		return &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
+		return &InternalError{
+			fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize()),
+		}
 	}
 
 	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)

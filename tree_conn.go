@@ -190,7 +190,7 @@ type treeConn struct {
 	treeId     uint32
 	shareFlags uint32
 
-	// path string
+	path string // UNC this tree is connected to (`\\server\share`); used for DFS referral lookups
 	// shareType  uint8
 	// capabilities uint32
 	// maximalAccess uint32
@@ -229,7 +229,7 @@ func treeConnect(ctx context.Context, s *session, path string, flags uint16, mc 
 		session:    s,
 		treeId:     smb2.PacketCodec(pkt).TreeId(),
 		shareFlags: r.ShareFlags(),
-		// path:    path,
+		path:       path,
 		// shareType:  r.ShareType(),
 		// capabilities: r.Capabilities(),
 		// maximalAccess: r.MaximalAccess(),
