@@ -3,7 +3,26 @@ package smb2
 import (
 	"testing"
 	"time"
+
+	"github.com/cloudsoda/go-smb2/internal/smb2"
 )
+
+func TestNameListServers(t *testing.T) {
+	nl := smb2.DfsReferral{
+		Flags:         0x0002, // name-list bit
+		ExpandedNames: []string{`\dc1.corp.acme.com`, ``, `\dc2.corp.acme.com`},
+	}
+	got := nameListServers(nl)
+	want := []string{"dc1.corp.acme.com", "dc2.corp.acme.com"}
+	if len(got) != len(want) {
+		t.Fatalf("nameListServers = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("server[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
 
 func TestDfsReferralCache(t *testing.T) {
 	c := newDfsReferralCache()

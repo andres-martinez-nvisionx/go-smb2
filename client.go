@@ -108,6 +108,7 @@ func (d *Dialer) DialConn(ctx context.Context, tcpConn net.Conn, address string)
 	if err != nil {
 		return nil, err
 	}
+	s.dialer = d // so DFS cross-server referrals can re-dial with the same credentials
 
 	return &Session{s: s, ctx: context.Background(), addr: tcpConn.RemoteAddr().String(), host: address}, nil
 }
@@ -335,9 +336,10 @@ func (c *Session) ListSharenames() ([]string, error) {
 // Share represents a SMB tree connection with VFS interface.
 type Share struct {
 	*treeConn
-	ctx      context.Context
-	mapping  utf16le.MapChars
-	dfsDepth int // number of DFS referrals followed to reach this share (loop guard)
+	ctx         context.Context
+	mapping     utf16le.MapChars
+	dfsDepth    int  // number of DFS referrals followed to reach this share (loop guard)
+	ownsSession bool // true for a cross-server DFS target we dialed; its session is torn down with the File
 }
 
 func (fs *Share) WithContext(ctx context.Context) *Share {
@@ -1229,6 +1231,8 @@ func (fs *Share) createFileRec(name string, req *smb2.CreateRequest) (f *File, e
 					continue
 				}
 			}
+			// STATUS_PATH_NOT_COVERED means name crosses a DFS link; resolve the
+			// referral and reopen on the target instead of failing the create.
 			if rerr, ok := err.(*ResponseError); ok && erref.NtStatus(rerr.Code) == erref.STATUS_PATH_NOT_COVERED {
 				return fs.followDfsReferral(name, req)
 			}
@@ -1345,6 +1349,12 @@ func (f *File) close() error {
 	f.fd = nil
 
 	runtime.SetFinalizer(f, nil)
+
+	// A cross-server DFS target is backed by a session we dialed solely to reach
+	// this File; tear it down on close so the connection is not leaked.
+	if f.fs != nil && f.fs.ownsSession {
+		f.fs.teardown()
+	}
 
 	return nil
 }

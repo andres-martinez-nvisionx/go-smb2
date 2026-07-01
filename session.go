@@ -261,6 +261,7 @@ func sessionSetup(ctx context.Context, conn *conn, i Initiator) (*session, error
 
 type session struct {
 	*conn
+	dialer                    *Dialer // retained so DFS can re-dial for cross-server referral targets
 	sessionFlags              uint16
 	sessionId                 uint64
 	preauthIntegrityHashValue [64]byte

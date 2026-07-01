@@ -89,3 +89,57 @@ func TestRespGetDfsReferralDecodeV4(t *testing.T) {
 		t.Errorf("NetworkAddress = %q, want %q", r.NetworkAddress, target)
 	}
 }
+
+// TestRespGetDfsReferralNameList decodes a V4 name-list (domain/DC) referral —
+// the domain-based DFS bootstrap entry that carries a list of DC / root-target
+// servers instead of a single NetworkAddress. Synthetic bytes (no AD needed);
+// swap them for a real SSB capture when available to raise fidelity.
+func TestRespGetDfsReferralNameList(t *testing.T) {
+	const special = `\CORP`
+	names := []string{`\dc1.corp.acme.com`, `\dc2.corp.acme.com`}
+
+	// Name-list V3/V4 fixed header is 18 bytes (no ServiceSiteGuid); strings follow.
+	const fixed = 18
+	specialB := encU16z(special)
+	var namesB []byte
+	for _, n := range names {
+		namesB = append(namesB, encU16z(n)...)
+	}
+
+	specialOff := fixed
+	expandedOff := specialOff + len(specialB)
+
+	entry := make([]byte, fixed)
+	le.PutUint16(entry[0:2], 4)                        // VersionNumber
+	le.PutUint16(entry[2:4], fixed)                    // Size (fixed part; strings are shared, after)
+	le.PutUint16(entry[4:6], 0)                        // ServerType
+	le.PutUint16(entry[6:8], 0x0002)                   // ReferralEntryFlags = name-list
+	le.PutUint32(entry[8:12], 600)                     // TimeToLive
+	le.PutUint16(entry[12:14], uint16(specialOff))     // SpecialNameOffset
+	le.PutUint16(entry[14:16], uint16(len(names)))     // NumberOfExpandedNames
+	le.PutUint16(entry[16:18], uint16(expandedOff))    // ExpandedNameOffset
+	entry = append(entry, specialB...)
+	entry = append(entry, namesB...)
+
+	resp := make([]byte, 8)
+	le.PutUint16(resp[2:4], 1) // NumberOfReferrals
+	resp = append(resp, entry...)
+
+	refs := RespGetDfsReferralDecoder(resp).Referrals()
+	if len(refs) != 1 {
+		t.Fatalf("got %d referrals, want 1", len(refs))
+	}
+	r := refs[0]
+	if !r.IsNameList() {
+		t.Fatal("IsNameList() = false, want true for a name-list referral")
+	}
+	if r.SpecialName != special {
+		t.Errorf("SpecialName = %q, want %q", r.SpecialName, special)
+	}
+	if len(r.ExpandedNames) != 2 || r.ExpandedNames[0] != names[0] || r.ExpandedNames[1] != names[1] {
+		t.Errorf("ExpandedNames = %v, want %v", r.ExpandedNames, names)
+	}
+	if r.NetworkAddress != "" {
+		t.Errorf("NetworkAddress = %q, want empty for a name-list referral", r.NetworkAddress)
+	}
+}

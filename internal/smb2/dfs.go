@@ -33,8 +33,11 @@ func (r *ReqGetDfsReferral) Encode(b []byte) {
 	le.PutUint16(b[off:off+2], 0) // null terminator
 }
 
-// DfsReferral is one decoded referral entry. NetworkAddress is the target the
-// client should reconnect to (e.g. `\server\share` or `\server\share\path`).
+// DfsReferral is one decoded referral entry. For a normal link referral,
+// NetworkAddress is the target the client should reconnect to (e.g.
+// `\server\share` or `\server\share\path`). For a name-list (domain/DC)
+// referral, NetworkAddress is empty and SpecialName/ExpandedNames are set
+// instead (see IsNameList).
 type DfsReferral struct {
 	VersionNumber  uint16
 	ServerType     uint16
@@ -42,6 +45,19 @@ type DfsReferral struct {
 	TimeToLive     uint32
 	DFSPath        string
 	NetworkAddress string
+
+	// Name-list (domain/DC) referral fields, set only when Flags has the
+	// name-list bit. SpecialName is the domain or server this entry refers to;
+	// ExpandedNames is the list of DC / root-target server names to try.
+	SpecialName   string
+	ExpandedNames []string
+}
+
+// IsNameList reports whether this is a name-list (domain/DC) referral, which
+// carries ExpandedNames instead of a single NetworkAddress. These are emitted
+// by domain-based DFS namespaces (the AD bootstrap step).
+func (r DfsReferral) IsNameList() bool {
+	return r.Flags&dfsNameListReferral != 0
 }
 
 // RespGetDfsReferralDecoder decodes a RESP_GET_DFS_REFERRAL output buffer
@@ -110,16 +126,24 @@ func (r RespGetDfsReferralDecoder) Referrals() []DfsReferral {
 				ref.NetworkAddress = dfsStringAt(entry, le.Uint16(entry[20:22]))
 			}
 		case 3, 4:
-			// DFS_REFERRAL_V3/V4 (normal, non-name-list): TTL(4)
-			// DFSPathOffset(2) DFSAlternatePathOffset(2) NetworkAddressOffset(2).
+			// DFS_REFERRAL_V3/V4 share a header up to TTL(4) at offset 8; the
+			// layout after it depends on the name-list bit (MS-DFSC 2.2.5.3/2.2.5.4).
 			if len(entry) >= 18 {
 				ref.TimeToLive = le.Uint32(entry[8:12])
 				if ref.Flags&dfsNameListReferral == 0 {
+					// Normal link referral: DFSPathOffset(2) DFSAlternatePathOffset(2)
+					// NetworkAddressOffset(2).
 					ref.DFSPath = dfsStringAt(entry, le.Uint16(entry[12:14]))
 					ref.NetworkAddress = dfsStringAt(entry, le.Uint16(entry[16:18]))
+				} else {
+					// Name-list (domain/DC) referral: SpecialNameOffset(2)
+					// NumberOfExpandedNames(2) ExpandedNameOffset(2). The expanded
+					// names are consecutive null-terminated UTF-16LE strings starting
+					// at ExpandedNameOffset.
+					ref.SpecialName = dfsStringAt(entry, le.Uint16(entry[12:14]))
+					n := int(le.Uint16(entry[14:16]))
+					ref.ExpandedNames = dfsStringList(entry, le.Uint16(entry[16:18]), n)
 				}
-				// Name-list (domain/DC) referrals use a different layout and are
-				// not needed to follow a link target; left unparsed for now.
 			}
 		}
 
@@ -137,6 +161,28 @@ func dfsStringAt(entry []byte, off uint16) string {
 		return ""
 	}
 	return dfsDecodeUTF16z(entry[off:])
+}
+
+// dfsStringList reads up to n consecutive null-terminated UTF-16LE strings
+// starting at an entry-relative offset (the name-list ExpandedNames layout),
+// with bounds checking. It stops early if the buffer runs out.
+func dfsStringList(entry []byte, off uint16, n int) []string {
+	if int(off) >= len(entry) || n <= 0 {
+		return nil
+	}
+	names := make([]string, 0, n)
+	b := entry[off:]
+	for i := 0; i < n && len(b) > 0; i++ {
+		s := dfsDecodeUTF16z(b)
+		names = append(names, s)
+		// Advance past this string and its 2-byte null terminator.
+		adv := len(utf16.Encode([]rune(s)))*2 + 2
+		if adv >= len(b) {
+			break
+		}
+		b = b[adv:]
+	}
+	return names
 }
 
 func dfsDecodeUTF16z(b []byte) string {
